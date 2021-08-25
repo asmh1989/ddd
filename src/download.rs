@@ -1,9 +1,18 @@
 use log::info;
 
-use once_cell::sync::OnceCell;
+use once_cell::sync::Lazy;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use reqwest::header::{self, HeaderValue};
-use std::{cmp::max, fs, io::Cursor, os::unix::prelude::MetadataExt};
+use std::{
+    cell::RefCell,
+    cmp::max,
+    fs,
+    io::Cursor,
+    os::unix::prelude::MetadataExt,
+    rc::Rc,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 use crate::{
     db::{Db, COLLECTION_CID_NOT_FOUND},
@@ -11,49 +20,161 @@ use crate::{
     model::PubChemNotFound,
 };
 
-static HEADERS: OnceCell<header::HeaderMap> = OnceCell::new();
+/// 一个最大并发量
+const IP_THREADS: usize = 4;
 
-pub fn init_header() {
-    let mut headers = header::HeaderMap::new();
-    headers.insert(
-        header::USER_AGENT,
-        HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.141 Safari/537.36 Edg/87.0.664.75"),
-    );
-    // headers.insert(header::HOST, HeaderValue::from_static("223.4.70.240"));
-    // headers.insert(
-    //     header::CONTENT_TYPE,
-    //     HeaderValue::from_static("application/x-www-form-urlencoded"),
-    // );
-    headers.insert(
-        header::ACCEPT,
-        HeaderValue::from_static("application/json; charset=utf-8"),
-    );
+static HTTP_PROXYS: Lazy<Mutex<Vec<&str>>> = Lazy::new(|| {
+    let m = [
+        ("127.0.0.1:7890"),
+        ("127.0.0.1:7891"),
+        ("127.0.0.1:7892"),
+        ("127.0.0.1:7893"),
+        ("192.168.2.228:7890"),
+        // ("106.12.88.204:8888"),
+        // ("173.82.20.11:8889"),
+        // (""),
+    ]
+    .iter()
+    .cloned()
+    .collect();
 
-    // headers.insert(
-    //     header::ORIGIN,
-    //     HeaderValue::from_static("http://223.4.65.131:8080"),
-    // );
+    Mutex::new(m)
+});
 
-    // headers.insert(
-    //     header::ACCEPT_ENCODING,
-    //     HeaderValue::from_static("gzip, deflate"),
-    // );
-
-    headers.insert(
-        header::REFERER,
-        HeaderValue::from_static("https://pubchem.ncbi.nlm.nih.gov/"),
-    );
-
-    let _ = HEADERS.set(headers);
+#[derive(Clone, Debug)]
+pub struct TreeNode {
+    pub next: Option<Rc<RefCell<TreeNode>>>,
+    pub ip: String,
+    pub visits: usize,
 }
 
-fn fetch_url(f: usize, file_name: String, usb_db: bool) -> Result<(), String> {
+#[inline]
+fn ptr_node(n: &Rc<RefCell<TreeNode>>) -> &mut TreeNode {
+    let t = n.as_ref().as_ptr();
+    unsafe { &mut *t }
+}
+
+impl TreeNode {
+    pub fn new(next: Option<Rc<RefCell<TreeNode>>>, ip: String) -> Self {
+        TreeNode {
+            next,
+            visits: 0,
+            ip,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PubDownload {
+    ips: Rc<RefCell<TreeNode>>,
+}
+
+impl PubDownload {
+    pub fn get_instance() -> Arc<Mutex<PubDownload>> {
+        static mut CONFIG: Option<Arc<Mutex<PubDownload>>> = None;
+
+        unsafe {
+            // Rust中使用可变静态变量都是unsafe的
+            CONFIG
+                .get_or_insert_with(|| {
+                    // 初始化单例对象的代码
+                    Arc::new(Mutex::new(PubDownload::new()))
+                })
+                .clone()
+        }
+    }
+
+    fn new() -> Self {
+        let ips = Rc::new(RefCell::new(TreeNode::new(None, "".to_string())));
+        let ips2 = &mut ips.clone();
+        let proxys = HTTP_PROXYS.lock().unwrap().clone();
+        proxys.iter().for_each(|&f| set_next_node(ips2, f));
+        Self { ips }
+    }
+
+    #[inline]
+    pub fn get_node() -> Rc<RefCell<TreeNode>> {
+        let n = PubDownload::get_instance().lock().unwrap().ips.clone();
+        n
+    }
+}
+
+fn set_next_node(node: &mut Rc<RefCell<TreeNode>>, ip: &str) {
+    let next = TreeNode::new(None, ip.to_string());
+
+    // info!("node = {:?}", node);
+    loop {
+        let n = ptr_node(node);
+        if n.ip.is_empty() {
+            n.ip = ip.to_string();
+            break;
+        }
+        if n.next.is_none() {
+            n.next = Some(Rc::new(RefCell::new(next)));
+            break;
+        }
+        *node = n.next.clone().unwrap();
+    }
+}
+
+fn get_use_ip() -> Option<String> {
+    let node = &mut PubDownload::get_node();
+    loop {
+        let n = ptr_node(node);
+        if n.visits < IP_THREADS {
+            n.visits += 1;
+            return Some(n.ip.clone());
+        }
+        if n.next.is_none() {
+            break;
+        }
+        *node = n.next.clone().unwrap();
+    }
+
+    None
+}
+
+fn release_ip(ip: &str) {
+    let node = &mut PubDownload::get_node();
+    loop {
+        let n = ptr_node(node);
+
+        if n.ip == ip {
+            if n.visits > 0 {
+                n.visits -= 1;
+            }
+            info!("release ip = {}", ip);
+
+            break;
+        }
+
+        if n.next.is_none() {
+            info!("ip = {}, not use", ip);
+            break;
+        }
+        *node = n.next.clone().unwrap();
+    }
+}
+
+fn fetch_url(f: usize, file_name: String, usb_db: bool, ip: &str) -> Result<(), String> {
+    info!(
+        "start download id = {}, path = {}, ip = {}",
+        f, file_name, ip
+    );
+
     let url = get_url(f);
     let path = std::path::Path::new(&file_name);
     let prefix = path.parent().unwrap();
     std::fs::create_dir_all(prefix).unwrap();
 
-    let client = reqwest::blocking::Client::new();
+    let client = if ip.is_empty() {
+        reqwest::blocking::Client::new()
+    } else {
+        reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::http(ip).expect("http proxy set error"))
+            .build()
+            .map_err(|e| e.to_string())?
+    };
 
     // let headers = HEADERS.get().expect("header not init");
 
@@ -62,9 +183,9 @@ fn fetch_url(f: usize, file_name: String, usb_db: bool) -> Result<(), String> {
         // .headers(headers.clone())
         .send()
         .map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        let code = response.status().as_u16();
+    let code = response.status().as_u16();
 
+    if !response.status().is_success() {
         if code == 404 && usb_db {
             let d = PubChemNotFound::new(&f.to_string());
             let _ = d.save_db();
@@ -124,10 +245,19 @@ fn get_chem(f: usize, use_db: bool) {
 
     if !file_exist(&path) {
         if !use_db || !Db::contians(COLLECTION_CID_NOT_FOUND, filter_cid!(&f.to_string())) {
-            info!("start download id = {}, path = {}", f, path);
-            let result = fetch_url(f, path, use_db);
-            if result.is_err() {
-                info!("id = {}, result = {:?}", f, result);
+            loop {
+                let ip = get_use_ip();
+                if let Some(i) = ip {
+                    let result = fetch_url(f, path.clone(), use_db, &i);
+                    if result.is_err() {
+                        info!("id = {}, result = {:?}", f, result);
+                    }
+                    release_ip(&i);
+                    break;
+                } else {
+                    info!("need sleep ...");
+                    thread::sleep(Duration::from_millis(2000))
+                }
             }
         }
     } else {
@@ -136,8 +266,14 @@ fn get_chem(f: usize, use_db: bool) {
 }
 
 pub fn download_chems(start: usize, use_db: bool) {
-    init_header();
-    let step = 1000000;
+    let step = 10000000;
+    let count = HTTP_PROXYS.lock().unwrap().len();
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(count * IP_THREADS)
+        .build_global()
+        .unwrap();
+
     (max(1, start * step)..(start + 1) * step)
         .into_par_iter()
         .for_each(|f| {
@@ -154,10 +290,12 @@ mod tests {
     fn init() {
         db::init_db("mongodb://192.168.2.25:27017");
         crate::config::init_config();
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build_global()
-            .unwrap();
+    }
+
+    #[test]
+    fn test_proxy_download() {
+        init();
+        download_chems(1, true);
     }
 
     #[test]
@@ -175,6 +313,40 @@ mod tests {
         info!("size = {}", mm.size());
 
         // assert!(file_exist("data/1000000/1000/1.json"));
+    }
+
+    #[test]
+    fn test_request_proxy() {
+        init();
+
+        let s = "".to_string();
+        let s2 = "";
+        if s == s2 {
+            info!("true");
+        }
+
+        assert!(s == s2);
+
+        info!("d = {:?}", get_use_ip());
+        info!("d = {:?}", get_use_ip());
+        info!("d = {:?}", get_use_ip());
+        info!("d = {:?}", get_use_ip());
+        info!("d = {:?}", get_use_ip());
+        info!("d = {:?}", get_use_ip());
+        info!("d = {:?}", get_use_ip());
+        info!("d = {:?}", get_use_ip());
+        info!("d = {:?}", release_ip(""));
+
+        info!("d = {:?}", PubDownload::get_instance().lock().unwrap());
+
+        let cid = 22222222;
+
+        let path = format!("data/{}", get_path_by_id(cid as usize));
+
+        let t = fetch_url(cid, path, true, "192.168.2.228:7890");
+        info!("t = {:?}", t);
+
+        // assert!(t.is_ok());
     }
 
     #[test]
