@@ -85,6 +85,34 @@ impl Db {
         collection.find_one(filter, options)
     }
 
+    pub fn insert_many(table: &str, data: Vec<Document>) -> Result<(), Error> {
+        let client = Db::get_instance();
+        let db = client.database(TABLE_NAME);
+        let collection = db.collection(table);
+        let date = Bson::DateTime(chrono::Utc::now());
+        let data2: Vec<Document> = data
+            .clone()
+            .iter_mut()
+            .map(|f| {
+                f.insert(KEY_UPDATE_TIME, date.clone());
+                f.insert(KEY_CREATE_TIME, date.clone());
+                f.to_owned()
+            })
+            .collect();
+
+        let _result = collection.insert_many(data2, None)?;
+
+        Ok(())
+    }
+
+    pub fn delete_table(table: &str) -> Result<(), Error> {
+        let client = Db::get_instance();
+        let db = client.database(TABLE_NAME);
+        let collection = db.collection(table);
+        let _ = collection.drop(None)?;
+        Ok(())
+    }
+
     pub fn save(table: &str, filter: Document, app: Document) -> Result<(), Error> {
         let client = Db::get_instance();
         let db = client.database(TABLE_NAME);
@@ -94,11 +122,15 @@ impl Db {
         let date = Bson::DateTime(chrono::Utc::now());
         update_doc.insert(KEY_UPDATE_TIME, date.clone());
 
-        let result = collection.count_documents(filter.clone(), None)?;
+        let result = collection.find_one_and_update(
+            filter.clone(),
+            doc! {"$set": update_doc.clone()},
+            None,
+        )?;
 
-        if result > 0 {
-            // info!("db update");
-            collection.update_one(filter.clone(), doc! {"$set": update_doc}, None)?;
+        if !result.is_none() {
+            info!("db update");
+            // collection.update_one(filter.clone(), doc! {"$set": update_doc}, None)?;
         } else {
             update_doc.insert(KEY_CREATE_TIME, date);
             let result = collection.insert_one(update_doc, None)?;
@@ -178,6 +210,13 @@ mod tests {
         assert!(data.save_db().is_ok());
 
         assert!(data.save_db().is_ok());
+
+        let result = Db::insert_many(
+            COLLECTION_CID_NOT_FOUND,
+            vec![doc! {"cid":"test1"}, doc! {"cid":"test2"}],
+        );
+
+        info!("result = {:?}", result);
 
         // let filter = doc! {};
         // let find_options = FindOneOptions::builder()

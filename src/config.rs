@@ -36,7 +36,7 @@ fn init_log() {
         .build(
             Root::builder()
                 .appender("stdout")
-                .appender("file")
+                // .appender("file")
                 .build(LevelFilter::Info),
         )
         .unwrap();
